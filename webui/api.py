@@ -96,8 +96,120 @@ class API:
         except Exception:
             return []
 
+    def preview_quant_scale_matches(self, folder):
+        """
+        Preview Quantification batch scale calibration.
+
+        When enabled in the UI, files whose stem contains "scale" are treated as
+        calibration-only. They are matched to analysis images by removing that
+        token from the scale filename and comparing normalized stems.
+        """
+        try:
+            import re
+
+            folder = os.path.expanduser(folder or "")
+            if not os.path.isdir(folder):
+                return {"status": "error", "error": "Folder not found"}
+
+            files = self.list_images(folder)
+
+            def is_scale_file(name):
+                return "scale" in Path(name).stem.lower()
+
+            def key_for(stem, remove_scale=False):
+                s = stem.lower()
+                if remove_scale:
+                    s = re.sub(r"scale(?:bar)?", " ", s)
+                s = re.sub(r"(?<!\d)x(\d+)(?!\d)", r"\1x", s)
+                return re.sub(r"[^a-z0-9]+", "_", s).strip("_")
+
+            scale_files = [f for f in files if is_scale_file(f)]
+            analysis_files = [f for f in files if not is_scale_file(f)]
+
+            scale_entries = []
+            for name in scale_files:
+                scale_entries.append({
+                    "filename": name,
+                    "path": os.path.join(folder, name),
+                    "key": key_for(Path(name).stem, remove_scale=True),
+                })
+
+            pairs, unmatched_images, used_scales = [], [], set()
+            for name in analysis_files:
+                image_key = key_for(Path(name).stem)
+                candidates = [
+                    s for s in scale_entries
+                    if s["key"] == image_key
+                    or (len(image_key) >= 4 and s["key"].startswith(image_key + "_"))
+                    or (len(s["key"]) >= 4 and image_key.startswith(s["key"] + "_"))
+                ]
+                candidates = [s for s in candidates if s["filename"] not in used_scales]
+                if not candidates:
+                    unmatched_images.append({
+                        "filename": name,
+                        "path": os.path.join(folder, name),
+                    })
+                    continue
+
+                scale = sorted(candidates, key=lambda s: (len(s["key"]), s["filename"]))[0]
+                used_scales.add(scale["filename"])
+                measured = self.extract_pixel_size(scale["path"])
+                row = {
+                    "filename": name,
+                    "path": os.path.join(folder, name),
+                    "scale_filename": scale["filename"],
+                    "scale_path": scale["path"],
+                    "status": measured.get("status"),
+                }
+                if measured.get("status") == "ok":
+                    row["pixel_size"] = measured["pixel_size"]
+                    row["bar_length_px"] = measured.get("bar_length_px")
+                else:
+                    row["pixel_size"] = None
+                    row["error"] = measured.get("error", "scale bar not detected")
+                pairs.append(row)
+
+            return {
+                "status": "ok",
+                "folder": folder,
+                "analysis_images": [
+                    {"filename": f, "path": os.path.join(folder, f)}
+                    for f in analysis_files
+                ],
+                "scale_images": [
+                    {"filename": s["filename"], "path": s["path"]}
+                    for s in scale_entries
+                ],
+                "pairs": pairs,
+                "unmatched_images": unmatched_images,
+                "unmatched_scale_images": [
+                    s["filename"] for s in scale_entries
+                    if s["filename"] not in used_scales
+                ],
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
     def get_standard_pixel_size(self, objective):
         return STANDARD_PIXEL_SIZE.get(objective, 0.5)
+
+    def preflight_check(self, workflow="quant"):
+        """Fast dependency/path check shown before a costly analysis begins."""
+        setup = self.get_setup()
+        checks = []
+        qpath = os.path.expanduser(setup.get("qupath_binary", ""))
+        model = os.path.expanduser(setup.get("instanseg_model", ""))
+        checks.append({"name": "QuPath", "ok": bool(qpath and os.path.exists(qpath)), "path": qpath})
+        checks.append({"name": "InstanSeg model", "ok": bool(model and os.path.exists(model)), "path": model})
+        required = ["numpy", "cv2", "PIL", "yaml"]
+        if workflow == "spatial": required += ["shapely", "scipy"]
+        for name in required:
+            try:
+                __import__(name)
+                checks.append({"name": name, "ok": True})
+            except Exception as e:
+                checks.append({"name": name, "ok": False, "error": str(e)})
+        return {"ok": all(c["ok"] for c in checks), "checks": checks}
 
     # ── Pipeline ───────────────────────────────────────────────────────────
     def run_pipeline(self, settings):
@@ -105,6 +217,14 @@ class API:
 
         pixel_size_mode = settings.get("pixel_size_mode", "manual")
         pixel_from_ui = pixel_size_mode in ("manual", "global")
+        if pixel_size_mode == "scale":
+            scale_path = settings.get("scale_image")
+            measured = self.extract_pixel_size(scale_path) if scale_path else {}
+            if measured.get("status") != "ok":
+                return {"ok": False, "msg": measured.get("error", "Scale-bar detection failed")}
+            settings["default_pixel_size"] = measured["pixel_size"]
+            settings["pixel_size_mode"] = "manual"
+            pixel_from_ui = True
 
         cfg = {
             **setup,
@@ -117,13 +237,23 @@ class API:
             "timeout_seconds":    1800,
             "mode":               "automated",
             "stain_type":         "hdab",
-            "image_extensions":   ["*.tif","*.tiff","*.svs","*.ndpi","*.png"],
+            "image_extensions":   ["*.tif","*.tiff","*.svs","*.ndpi","*.png","*.jpg","*.jpeg"],
             "magnification":      "auto",
             "export_geojson":     True,
             "overlay_downsample": 1.0,
             "_pixel_size_from_ui": pixel_from_ui,
             "objective":          settings.get("objective", "10x"),
         }
+        # Single-image Quant has an explicit stain/compartment selection; route it
+        # directly to that file rather than depending on hyphen-sensitive filename
+        # token matching (TIM-3 vs Tim3). Batch whitelists are used only to exclude
+        # calibration images, so batch threshold routing remains filename/stain-based.
+        if settings.get("analysis_mode") == "single":
+            for filename in settings.get("image_whitelist") or []:
+                cfg.setdefault("threshold_overrides", {})[filename] = float(
+                    settings.get("dab_threshold", 0.2))
+                cfg.setdefault("cytoplasm_overrides", {})[filename] = bool(
+                    settings.get("use_cytoplasm_measurement", False))
 
         for k in ["input_dir","output_dir","dashboard_dir","instanseg_model"]:
             if k in cfg and cfg[k]:
@@ -196,10 +326,15 @@ class API:
         output_dir    = cfg.get("output_dir","")
         dashboard_dir = cfg.get("dashboard_dir","")
         metrics = []
+        whitelist = {str(x) for x in (cfg.get("image_whitelist") or [])}
         for jp in sorted(glob.glob(str(Path(output_dir) / "*_summary.json"))):
             try:
                 with open(jp) as f:
                     d = json.load(f)
+                if whitelist:
+                    source_name = str(d.get("image", "")).split(" - ")[0]
+                    if source_name not in whitelist:
+                        continue
                 metrics.append({
                     "name":        Path(d.get("image","")).stem.split(" - ")[0],
                     "total_cells": d.get("total_cells",0),
@@ -208,6 +343,7 @@ class API:
                     "positivity":  float(d.get("positivity_pct",0)),
                     "pixel_size":  d.get("pixel_size_um",0.5),
                     "threshold":   d.get("dab_threshold",0.2),
+                    "measurement_compartment": d.get("measurement_compartment", "nucleus"),
                 })
             except Exception:
                 continue
@@ -217,8 +353,8 @@ class API:
         if sp.exists():
             summary_text = sp.read_text().strip()
 
-        dashboards = sorted(glob.glob(str(Path(dashboard_dir) / "ihc_dashboard_*.html")))
-        excels     = sorted(glob.glob(str(Path(dashboard_dir) / "ihc_results_*.xlsx")))
+        dashboards = sorted(glob.glob(str(Path(dashboard_dir) / "ihc_dashboard_*.html")), key=os.path.getmtime)
+        excels     = sorted(glob.glob(str(Path(dashboard_dir) / "ihc_results_*.xlsx")), key=os.path.getmtime)
 
         overlays_dir = str(Path(output_dir) / "overlays")
         overlays = glob.glob(str(Path(output_dir) / "*_overlay.png"))
@@ -282,81 +418,392 @@ Answer concisely and scientifically. Methods sections use past tense passive voi
                 self._process.terminate()
         return {"ok": True}
 
-    # ── File matching (for Co-localization UI) ─────────────────────────────
-    def preview_pairs(self, mode: str, folder_a: str, folder_b: str = None) -> dict:
-        """
-        Detect image pairs for co-localization without running any analysis.
+    def _load_spatial_results(self, output_dir: str) -> list:
+        """Load combined spatial-association results from disk."""
+        path = Path(output_dir) / "spatial_association_results.json"
+        if path.exists():
+            try:
+                with open(path) as f:
+                    results = json.load(f)
+                # Attach output_dir for UI actions
+                for r in results:
+                    r.setdefault("output_dir", output_dir)
+                return results
+            except Exception:
+                pass
+        return []
 
-        mode: "two_folder" | "single_folder"
-        Returns pairs list + unmatched lists for UI preview.
+    # ── Spatial Association ─────────────────────────────────────────────────
+    def pick_file(self):
+        """Open a single-file picker (used for image + scale-image selection)."""
+        import webview
+        result = self._window.create_file_dialog(
+            webview.OPEN_DIALOG, allow_multiple=False,
+            file_types=("Image files (*.tif;*.tiff;*.svs;*.ndpi;*.png;*.jpg;*.jpeg)",
+                        "All files (*.*)"),
+        )
+        if result and len(result) > 0:
+            return result[0]
+        return None
+
+    def extract_pixel_size(self, image_path: str) -> dict:
+        """Extract pixel size (µm/px) from a burned-in 100 µm scale bar."""
+        try:
+            sys.path.insert(0, str(PROJECT_DIR))
+            from pixel_size_util import _detect_scale_bar
+            px, bar = _detect_scale_bar(os.path.expanduser(image_path))
+            if px is None:
+                return {"status": "error", "error": "could not detect scale bar"}
+            return {"status": "ok", "pixel_size": round(float(px), 4),
+                    "bar_length_px": int(bar)}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def prepare_landmark_pair(self, ref_path: str, mov_path: str) -> dict:
+        """Return compact, blinded browser previews while retaining full-res coordinates."""
+        try:
+            import base64
+            from io import BytesIO
+            from PIL import Image
+
+            def preview(path):
+                im = Image.open(os.path.expanduser(path)).convert("RGB")
+                width, height = im.size
+                im.thumbnail((1200, 900), Image.Resampling.LANCZOS)
+                buf = BytesIO()
+                im.save(buf, "JPEG", quality=86)
+                return {
+                    "data_url": "data:image/jpeg;base64," +
+                                base64.b64encode(buf.getvalue()).decode("ascii"),
+                    "width": width, "height": height,
+                }
+
+            return {"status": "ok", "ref": preview(ref_path), "mov": preview(mov_path)}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def validate_pair_paths(self, ref_path: str, mov_path: str) -> dict:
+        """Catch obvious cross-sample selections before landmarking or segmentation."""
+        try:
+            sys.path.insert(0, str(PROJECT_DIR))
+            from file_matcher import normalize_name
+            a = Path(ref_path).stem
+            b = Path(mov_path).stem
+            key_a, stain_a = normalize_name(a)
+            key_b, stain_b = normalize_name(b)
+            ok = key_a == key_b
+            return {"status": "ok", "compatible": ok, "key_a": key_a, "key_b": key_b,
+                    "stain_a": stain_a, "stain_b": stain_b,
+                    "reason": ("Filename sample identifiers match" if ok else
+                               f"Sample identifiers differ: {key_a} vs {key_b}")}
+        except Exception as e:
+            return {"status": "error", "compatible": False, "error": str(e)}
+
+    def certify_landmarks(self, payload: dict) -> dict:
+        """Fit and certify a full-resolution moving→reference similarity transform."""
+        try:
+            import numpy as np
+            sys.path.insert(0, str(PROJECT_DIR))
+            from serial_registration import landmark_register_and_verify
+
+            ref = np.asarray(payload.get("ref_points") or [], dtype=float)
+            mov = np.asarray(payload.get("mov_points") or [], dtype=float)
+            px = float(payload.get("pixel_size_um") or 0)
+            if px <= 0:
+                return {"status": "error", "error": "A valid pixel size is required"}
+            wh = payload.get("image_wh") or None
+            image_wh = tuple(wh) if wh and len(wh) == 2 else None
+            result = landmark_register_and_verify(
+                ref, mov, px, image_wh=image_wh,
+                min_n=6, target_n=12, loo_max_um=5.0, fit_max_um=5.0,
+                deformed_loo_um=15.0, min_roi_frac=0.10,
+            )
+            matrix = result.get("matrix")
+            result["matrix"] = (matrix.tolist() if hasattr(matrix, "tolist") else matrix)
+            result["is_certified"] = result.get("verdict") in (
+                "CERTIFIED", "LOCALLY_CERTIFIED")
+            result["status"] = result.get("verdict")
+            result["method"] = "manual_landmark_similarity"
+            result["ref_points"] = ref.tolist()
+            result["mov_points"] = mov.tolist()
+            result["pixel_size_um"] = px
+            return {"status": "ok", "certification": result}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def certify_expert_landmarks(self, ref_path: str, mov_path: str,
+                                 pixel_size_um: float) -> dict:
+        """Certify a pair from the bundled CIMA/ANHIR EXPERT landmark CSVs.
+
+        For validation/demo cohorts whose expert landmarks ship in
+        validation/public_landmarks (e.g. lung-lesion_1 Cc10/Ki67/proSPC). The
+        two image filenames are matched to their expert landmark CSVs by stain
+        token; the certification is otherwise identical to certify_landmarks
+        (same thresholds), so a reviewer cannot tell an imported certification
+        apart from a hand-placed one except by the `method` field. Returns the
+        same shape as certify_landmarks; errors out (never silently passes) if
+        expert landmarks for both stains are not found.
         """
+        try:
+            import re, glob
+            import numpy as np
+            sys.path.insert(0, str(PROJECT_DIR))
+            from file_matcher import normalize_name
+            from serial_registration import landmark_register_and_verify
+
+            px = float(pixel_size_um or 0)
+            if px <= 0:
+                return {"status": "error", "error": "A valid pixel size is required"}
+
+            _, stain_a = normalize_name(Path(ref_path).stem)
+            _, stain_b = normalize_name(Path(mov_path).stem)
+            if not stain_a or not stain_b:
+                return {"status": "error", "error": (
+                    "Could not identify both stains from the filenames; expert-"
+                    "landmark import needs recognised stain tokens in each name.")}
+
+            ann = PROJECT_DIR / "validation" / "public_landmarks" / "annotations"
+            key = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+            ka, kb = key(stain_a), key(stain_b)
+
+            def find_csvs(d):
+                hit = {}
+                for c in glob.glob(os.path.join(d, "*.csv")):
+                    ck = key(Path(c).stem)
+                    if ka in ck and "a" not in hit: hit["a"] = c
+                    if kb in ck and "b" not in hit: hit["b"] = c
+                return hit if "a" in hit and "b" in hit else None
+
+            found = None
+            for tissue in sorted(glob.glob(str(ann / "*"))):
+                for psdir in sorted(glob.glob(os.path.join(tissue, "user-PS_scale-*"))):
+                    found = find_csvs(psdir)
+                    if found:
+                        break
+                if found:
+                    break
+            if not found:
+                return {"status": "error", "error": (
+                    f"No bundled expert landmarks found for stains "
+                    f"'{stain_a}'/'{stain_b}'.")}
+
+            def load_xy(path):
+                rows = list(__import__("csv").reader(open(path)))
+                pts = [[float(r[1]), float(r[2])] for r in rows[1:] if len(r) >= 3]
+                return np.asarray(pts, dtype=float)
+
+            ref, mov = load_xy(found["a"]), load_xy(found["b"])
+            n = min(len(ref), len(mov))
+            if n < 6:
+                return {"status": "error", "error": "Fewer than 6 expert landmarks."}
+
+            # Bind certification to the ACTUAL image being analysed (its real px dims).
+            from PIL import Image
+            with Image.open(os.path.expanduser(ref_path)) as im:
+                image_wh = im.size  # (w, h)
+
+            result = landmark_register_and_verify(
+                ref[:n], mov[:n], px, image_wh=image_wh,
+                min_n=6, target_n=12, loo_max_um=5.0, fit_max_um=5.0,
+                deformed_loo_um=15.0, min_roi_frac=0.10,
+            )
+            matrix = result.get("matrix")
+            result["matrix"] = (matrix.tolist() if hasattr(matrix, "tolist") else matrix)
+            result["is_certified"] = result.get("verdict") in (
+                "CERTIFIED", "LOCALLY_CERTIFIED")
+            result["status"] = result.get("verdict")
+            result["method"] = "cima_expert_landmark_import"
+            result["landmark_source"] = os.path.relpath(found["a"], str(PROJECT_DIR))
+            result["ref_points"] = ref[:n].tolist()
+            result["mov_points"] = mov[:n].tolist()
+            result["pixel_size_um"] = px
+            return {"status": "ok", "certification": result}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def preview_batch_pairs(self, folder_a: str, folder_b: str = None,
+                            mode: str = "two_folder") -> dict:
+        """Match images for a batch run (no analysis) — pairs + unmatched + scaled."""
         try:
             sys.path.insert(0, str(PROJECT_DIR))
             from file_matcher import match_two_folders, match_single_folder
             if mode == "two_folder":
                 if not folder_a or not folder_b:
-                    return {"ok": False, "error": "Both folders required for two-folder mode"}
-                result = match_two_folders(
-                    os.path.expanduser(folder_a),
-                    os.path.expanduser(folder_b),
-                )
+                    return {"status": "error", "error": "Both folders required"}
+                result = match_two_folders(os.path.expanduser(folder_a),
+                                           os.path.expanduser(folder_b))
             else:
                 if not folder_a:
-                    return {"ok": False, "error": "Folder required"}
+                    return {"status": "error", "error": "Folder required"}
                 result = match_single_folder(os.path.expanduser(folder_a))
-            return {"ok": True, **result}
+            return {"status": "ok", **result}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"status": "error", "error": str(e)}
 
-    # ── Co-localization pipeline ───────────────────────────────────────────
-    def run_coloc_pipeline(self, settings: dict) -> dict:
-        """Run the co-localization pipeline in a background thread."""
-        pairs = settings.get("pairs", [])
-        if not pairs:
-            return {"ok": False, "error": "No pairs provided"}
+    def get_spatial_association_results(self, output_dir: str) -> dict:
+        """Load spatial-association results (incl. null stats + QC overlay paths)."""
+        output_dir = os.path.expanduser(output_dir)
+        results = self._load_spatial_results(output_dir)   # null stats now persisted
+        return {"status": "ok", "results": results, "output_dir": output_dir}
 
-        setup = self.get_setup()
+    def run_spatial_association(self, config: dict) -> dict:
+        """
+        Run the spatial-association pipeline (single pair or batch) in a thread.
+        Reuses the shared pipeline (run_pipeline.py --mode spatial); per-image
+        pixel sizes are resolved up front and injected as pixel_overrides.
+        """
+        try:
+            sys.path.insert(0, str(PROJECT_DIR))
+            from run_pipeline import resolve_pixel_size
+            from pixel_size_util import extract_pixel_size_from_scale_bar
+        except Exception as e:
+            self._emit("done", {"ok": False, "msg": f"import failed: {e}"})
+            return {"ok": False}
+
+        def _exp(p):
+            return os.path.expanduser(p) if p else None
+
+        setup      = self.get_setup()
         output_dir = os.path.expanduser(
-            settings.get("output_dir", str(Path.home() / "Desktop/ihc_coloc_results"))
-        )
+            config.get("output_dir", str(Path.home() / "Desktop/ihc_spatial_results")))
         os.makedirs(output_dir, exist_ok=True)
+
+        mode          = config.get("mode", "single")
+        certifications = config.get("certifications") or {}
+        session_px    = config.get("session_pixel_size")
+        session_scale = _exp(config.get("session_scale_image"))
+        # Per-image DAB thresholds from the UI (Image A vs Image B). These flow to
+        # QuPath as per-image overrides (priority over stain_thresholds matching).
+        dab_threshold_a = config.get("dab_threshold_a", 0.20)
+        dab_threshold_b = config.get("dab_threshold_b", 0.10)
+        # Optional per-image membrane remeasurement. Preserve QuPath for both by
+        # default; cytoplasm mode must be explicitly requested.
+        use_cyto_a = bool(config.get("use_cytoplasm_a", False))
+        use_cyto_b = bool(config.get("use_cytoplasm_b", False))
+        cell_expansion_um = config.get("cell_expansion_um", 2.0)
+        pixel_overrides, threshold_overrides, cytoplasm_overrides = {}, {}, {}
+        pairs, unmatched = [], []
+
+        # Resolve the session calibration to ONE concrete value up front, so it
+        # flows to every image as the default (priority step 3) unless that image
+        # has its own per-image override. Without this, scale-image session
+        # calibration left session_pixel_size=None and each analysis image fell
+        # through to per-image scale-bar extraction (wrong values, e.g. TIM-3).
+        session_value = None
+        if session_px and float(session_px) > 0:
+            session_value = float(session_px)
+        elif session_scale:
+            session_value = extract_pixel_size_from_scale_bar(session_scale)
+        if session_value:
+            self._emit("log", {"msg": f"Session pixel size: {session_value:.4f} µm/px "
+                                      f"(default for all images unless overridden)",
+                               "level": "info"})
+
+        if mode == "single":
+            ia = _exp(config.get("image_a")) or ""
+            ib = _exp(config.get("image_b")) or ""
+            la = (config.get("label_a") or "MARKER_A").upper()
+            lb = (config.get("label_b") or "MARKER_B").upper()
+            pa = resolve_pixel_size(session_value, ia, _exp(config.get("scale_image_a")),
+                                    config.get("pixel_size_a"))
+            pb = resolve_pixel_size(session_value, ib, _exp(config.get("scale_image_b")),
+                                    config.get("pixel_size_b"))
+            pixel_overrides[os.path.basename(ia)] = pa
+            pixel_overrides[os.path.basename(ib)] = pb
+            threshold_overrides[os.path.basename(ia)] = dab_threshold_a
+            threshold_overrides[os.path.basename(ib)] = dab_threshold_b
+            cytoplasm_overrides[os.path.basename(ia)] = use_cyto_a
+            cytoplasm_overrides[os.path.basename(ib)] = use_cyto_b
+            ref_px = pa
+            sid = os.path.splitext(os.path.basename(ia))[0] or "pair"
+            pairs = [{"sample_id": sid, "stain_a": la, "stain_b": lb,
+                      "path_a": ia, "path_b": ib,
+                      "filename_a": os.path.basename(ia),
+                      "filename_b": os.path.basename(ib),
+                      "certification": certifications.get(sid)}]
+        else:
+            prev = self.preview_batch_pairs(config.get("folder_a"),
+                                            config.get("folder_b"),
+                                            config.get("folder_mode", "two_folder"))
+            if prev.get("status") != "ok":
+                self._emit("done", {"ok": False, "msg": prev.get("error", "matching failed")})
+                return {"ok": False}
+            pairs     = prev.get("pairs", [])
+            for p in pairs:
+                p["certification"] = certifications.get(p.get("sample_id"))
+            unmatched = prev.get("unmatched", [])
+            # One session pixel size applied to every image in the batch
+            ref_px = resolve_pixel_size(session_value, "", None, None)
+            for p in pairs:
+                pixel_overrides[os.path.basename(p["path_a"])] = ref_px
+                pixel_overrides[os.path.basename(p["path_b"])] = ref_px
+                threshold_overrides[os.path.basename(p["path_a"])] = dab_threshold_a
+                threshold_overrides[os.path.basename(p["path_b"])] = dab_threshold_b
+                cytoplasm_overrides[os.path.basename(p["path_a"])] = use_cyto_a
+                cytoplasm_overrides[os.path.basename(p["path_b"])] = use_cyto_b
+
+        if not pairs:
+            self._emit("done", {"ok": False, "msg": "No pairs to analyze"})
+            return {"ok": False}
 
         cfg = {
             **setup,
-            "qupath_binary":      setup.get("qupath_binary", DEFAULT_SETUP["qupath_binary"]),
-            "instanseg_model":    setup.get("instanseg_model", DEFAULT_SETUP["instanseg_model"]),
-            "device":             setup.get("device", "mps"),
-            "instanseg_threads":  setup.get("instanseg_threads", 4),
-            "tile_dims":          512,
-            "timeout_seconds":    1800,
-            "mode":               "automated",
-            "stain_type":         "hdab",
-            "image_extensions":   ["*.tif","*.tiff","*.svs","*.ndpi","*.png"],
-            "magnification":      "auto",
-            "export_geojson":     True,
-            "dab_threshold":      settings.get("dab_threshold", 0.2),
-            "output_dir":         output_dir,
-            "dashboard_dir":      output_dir,
-            "default_pixel_size": settings.get("pixel_size", 0.5),
+            "qupath_binary":       setup.get("qupath_binary", DEFAULT_SETUP["qupath_binary"]),
+            "instanseg_model":     setup.get("instanseg_model", DEFAULT_SETUP["instanseg_model"]),
+            "device":              setup.get("device", "mps"),
+            "instanseg_threads":   setup.get("instanseg_threads", 4),
+            "tile_dims":           512,
+            "timeout_seconds":     1800,
+            "mode":                "spatial",
+            "stain_type":          "hdab",
+            "image_extensions":    ["*.tif","*.tiff","*.svs","*.ndpi","*.png"],
+            "magnification":       "auto",
+            "export_geojson":      True,
+            "dab_threshold":       config.get("dab_threshold", 0.2),
+            "output_dir":          output_dir,
+            "dashboard_dir":       output_dir,
+            "default_pixel_size":  ref_px,
+            "pixel_overrides":     pixel_overrides,
+            "threshold_overrides": threshold_overrides,
+            "cytoplasm_overrides": cytoplasm_overrides,
+            "cell_expansion_um":   cell_expansion_um,
             "_pixel_size_from_ui": True,
-            "pixel_size_mode":    "global",
-            "max_distance_um":    settings.get("max_distance_um", 10.0),
-            "enable_registration": settings.get("enable_registration", True),
-            "cleanup_intermediates": settings.get("cleanup_intermediates", False),
-            "coloc_pairs":        pairs,
+            "pixel_size_mode":     "global",
+            "max_distance_um":     config.get("max_distance_um", 10.0),
+            "enable_registration": config.get("enable_registration", True),
+            "cleanup_intermediates": config.get("cleanup_intermediates", False),
+            "spatial_pairs":       pairs,
+            "require_landmark_certification": True,
         }
 
-        config_path = str(CONFIG_DIR / "coloc_config.yaml")
+        # Per-stain DAB thresholds — mirror the CLI pipeline so the Spatial
+        # Association tab also gives TIM-3 images 0.1 and CD8 images 0.2. Use the
+        # user's saved setup value if present, otherwise fall back to defaults.
+        if setup.get("stain_thresholds"):
+            cfg["stain_thresholds"] = setup.get("stain_thresholds", {})
+        else:
+            cfg["stain_thresholds"] = {
+                "cd8": 0.2,
+                "tim3": 0.1,
+                "tim-3": 0.1,
+            }
+
+        config_path = str(CONFIG_DIR / "spatial_config.yaml")
         with open(config_path, "w") as f:
             yaml.dump(cfg, f, default_flow_style=False)
 
         def run():
             try:
+                # Surface unmatched files as warnings before starting
+                for u in unmatched:
+                    self._emit("log", {"msg": f"Unmatched: {u.get('filename')} — "
+                                              f"{u.get('reason','no pair')}", "level": "warn"})
+
                 skip = ["[INFO ]","[WARN ]","Measured Detection","Completed Annotation",
                         "Processing complete in","Measuring","Loading:","████","WARNING: Unknown"]
                 self._process = subprocess.Popen(
                     [str(Path(sys.executable)), str(PROJECT_DIR / "run_pipeline.py"),
-                     "--config", config_path, "--mode", "coloc"],
+                     "--config", config_path, "--mode", "spatial"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, start_new_session=True, cwd=str(PROJECT_DIR),
                 )
@@ -372,43 +819,79 @@ Answer concisely and scientifically. Methods sections use past tense passive voi
                     level = "normal"
                     if any(x in clean for x in ["ERROR","FAILED","TIMEOUT"]):
                         level = "error"
-                    elif any(x in clean for x in ["WARNING"]):
+                    elif any(x in clean for x in ["WARNING","Unmatched"]):
                         level = "warn"
-                    elif any(x in clean for x in ["✓","COMPLETE","complete","matched cells"]):
+                    elif any(x in clean for x in ["✓","COMPLETE","complete","matched cells","QC overlay"]):
                         level = "ok"
                     elif any(x in clean for x in ["Processing","Registering","Matching",
-                                                   "Co-expression","Running","PAIR","STARTING"]):
+                                                  "Association","Running","PAIR","Pixel size"]):
                         level = "info"
                     self._emit("log", {"msg": clean, "level": level})
 
                 if self._process.returncode == 0:
                     self._emit("progress", {"pct": 100})
-                    results = self._load_coloc_results(output_dir)
-                    self._emit("done", {"ok": True, "results": results})
+                    res = self.get_spatial_association_results(output_dir)
+                    results = res.get("results", [])
+                    # Summary across pairs: cross-type association is a curve, so
+                    # we aggregate the per-pair verdict. QC-invalid pairs are
+                    # EXCLUDED (statistics not interpretable). Among QC-valid pairs we
+                    # count SIGNIFICANT findings (verdict 'robust' = significant under
+                    # the calibrated reweighted primary) separately from CSR-ONLY
+                    # findings (significant only under the weak homogeneous baseline,
+                    # i.e. a shared-preference artifact — see ihc.md §15).
+                    n_sig, global_ps, n_excluded_qc = 0, [], 0
+                    n_robust, n_csr_only = 0, 0
+                    for r in results:
+                        qc = r.get("registration_qc") or {}
+                        if qc.get("status") == "invalid":
+                            n_excluded_qc += 1
+                            continue
+                        for v in (r.get("spatial_association") or {}).get("association", {}).values():
+                            g = v.get("global", {}) or {}
+                            rob = v.get("robustness", {}) or {}
+                            if g.get("significant"):
+                                n_sig += 1
+                            if rob.get("verdict") == "robust":
+                                n_robust += 1
+                            elif rob.get("verdict") == "csr_only":
+                                n_csr_only += 1
+                            if isinstance(g.get("global_p_dclf"), (int, float)):
+                                global_ps.append(g["global_p_dclf"])
+                    # Cohort-level multiple-comparison correction across the
+                    # QC-valid pairs' DCLF p-values. The raw minimum is a
+                    # multiplicity trap; any cohort claim must use the FDR result.
+                    cohort_fdr = None
+                    try:
+                        from spatial_stats import cohort_multiple_comparison_correction
+                        cohort_fdr = cohort_multiple_comparison_correction(
+                            global_ps, method="bh")
+                    except Exception as e:
+                        self._emit("log", {"msg": f"Cohort FDR correction failed: {e}",
+                                           "level": "warn"})
+                    summary = {
+                        "pairs":          len(results),
+                        "n_significant":  n_sig,
+                        "n_robust":       n_robust,
+                        "n_csr_only":     n_csr_only,
+                        "n_excluded_qc":  n_excluded_qc,
+                        # Raw minimum kept for transparency but explicitly labelled
+                        # as NOT a cohort finding (see cohort_fdr / the UI note).
+                        "min_global_p_raw": round(min(global_ps), 4) if global_ps else None,
+                        "cohort_fdr":     cohort_fdr,
+                    }
+                    self._emit("spatial_assoc_complete",
+                               {"ok": True, "results": results,
+                                "summary": summary, "output_dir": output_dir})
                 else:
                     stderr = self._process.stderr.read()
-                    self._emit("done", {"ok": False, "msg": "Co-localization pipeline failed",
+                    self._emit("done", {"ok": False,
+                                        "msg": "Spatial association pipeline failed",
                                         "stderr": stderr[-500:] if stderr else ""})
             except Exception as e:
                 self._emit("done", {"ok": False, "msg": str(e)})
 
         threading.Thread(target=run, daemon=True).start()
         return {"ok": True}
-
-    def _load_coloc_results(self, output_dir: str) -> list:
-        """Load combined co-localization results from disk."""
-        path = Path(output_dir) / "coloc_results.json"
-        if path.exists():
-            try:
-                with open(path) as f:
-                    results = json.load(f)
-                # Attach output_dir for UI actions
-                for r in results:
-                    r.setdefault("output_dir", output_dir)
-                return results
-            except Exception:
-                pass
-        return []
 
     def get_home(self) -> str:
         """Return user home directory for UI path defaults."""
@@ -425,3 +908,8 @@ Answer concisely and scientifically. Methods sections use past tense passive voi
             subprocess.Popen(["open", path])
             return {"ok": True}
         return {"ok": False}
+
+
+# Isolated additive extension: same-section restained co-expression workflow.
+from webui.restained_api import attach_restained_api
+attach_restained_api(API)

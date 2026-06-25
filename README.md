@@ -1,47 +1,44 @@
-# IHC Analyzer
+# IHC Analyzer — *Spatial biology for the price of a stain*
 
-Desktop and command-line tooling for automated immunohistochemistry (IHC)
-analysis of H-DAB/DAB-stained tissue images. The pipeline uses QuPath with
-InstanSeg for nucleus detection, exports cell-level results, draws overlays,
-and generates dashboard and Excel summaries.
+Recover cell-resolution spatial immune information from ordinary **brightfield
+immunohistochemistry** — the ~$10 stain every pathology lab already runs — instead of a
+six-figure multiplex machine, with an instrument designed so it **cannot report a
+conclusion it cannot defend**.
 
-The project is designed for research workflows where repeated manual cell
-counting is slow or inconsistent. It keeps microscope-specific settings local
-and does not require committing image data, API keys, or per-machine paths.
+The analysis core is deterministic (QuPath + InstanSeg for segmentation; classical spatial
+statistics) and every sensitive conclusion is gated behind an explicit validity check:
+uncertified registration, uncertified cell correspondence, and shared-tissue-preference
+artifacts are **blocked or flagged, never silently reported**.
 
-## Features
+## The three pipelines
 
-- Batch DAB-positive cell quantification from brightfield IHC images.
-- QuPath headless execution with InstanSeg `brightfield_nuclei`.
-- Fixed DAB optical-density threshold with configurable pixel size.
-- GeoJSON cell-boundary export and OpenCV overlay rendering.
-- HTML dashboard and Excel workbook generation.
-- pywebview desktop UI for setup, experiment management, analysis, results,
-  and optional AI-assisted result discussion.
-- Co-localization workflow for paired serial-section stains using image
-  registration and mutual nearest-neighbour cell matching.
+1. **Quantification** — per-image DAB-positive cell counting from brightfield IHC. The
+   validated, deterministic core.
+2. **Serial-section Spatial Association** — for two markers on *adjacent* sections:
+   landmark-certified registration + intensity-reweighted cross-type Ripley's K against a
+   calibrated null + a global DCLF significance test. A **population-level** statistic — it
+   does **not** assert single-cell co-expression (serial sections are different Z-planes).
+3. **Same-section Restained Co-expression** — for stains imaged on the *same* physical
+   section (stain → image → strip → restain → image): segment once, reuse the exact cell
+   coordinates across captures, and call genuine **single-cell** co-expression with a 2×2
+   contingency test, gated behind manual coordinate-correspondence certification.
 
 ## Architecture
 
 ```text
-Raw images
-  -> QuPath headless + InstanSeg
+Raw brightfield images
+  -> QuPath headless + InstanSeg (brightfield_nuclei)
   -> CSV / GeoJSON / JSON exports
-  -> Python overlays, dashboard, Excel, co-localization
-  -> pywebview desktop UI
+  -> Python: overlays, dashboard, Excel, spatial association, restained co-expression
+  -> pywebview desktop UI (Quantification / Spatial / Restained tabs)
 ```
 
 ## Requirements
 
-- Python 3.10 or newer.
-- QuPath 0.7.x with the InstanSeg extension installed.
-- InstanSeg `brightfield_nuclei-0.1.1` model downloaded locally.
-- macOS is the currently targeted desktop environment.
-
-Optional AI chat support uses either:
-
-- `GEMINI_API_KEY` for Gemini.
-- `ANTHROPIC_API_KEY` for Claude.
+- Python 3.10+
+- QuPath 0.7.x with the InstanSeg extension
+- InstanSeg `brightfield_nuclei-0.1.1` model downloaded locally
+- macOS is the currently targeted desktop environment
 
 ## Setup
 
@@ -50,63 +47,59 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-cp config.example.yaml config.yaml
+cp config.example.yaml config.yaml   # then edit local paths
 ```
 
-Edit `config.yaml` with local paths for:
+Edit `config.yaml` with local paths for `input_dir`, `output_dir`, `dashboard_dir`,
+`qupath_binary`, and `instanseg_model`. The desktop app stores user setup in
+`~/.ihc_analyzer/`. An optional in-app results-chat assistant can use an LLM provider key
+(`GEMINI_API_KEY` or `ANTHROPIC_API_KEY`); it is unrelated to the deterministic analysis core.
 
-- `input_dir`
-- `output_dir`
-- `dashboard_dir`
-- `qupath_binary`
-- `instanseg_model`
-
-The desktop app also stores user setup in `~/.ihc_analyzer/`.
-
-## Run The Desktop App
+## Usage
 
 ```bash
-python app.py
+python app.py                                   # desktop UI (all three tabs)
+python run_pipeline.py --config config.yaml     # quantification
+python run_pipeline.py --config config.yaml --mode spatial   # serial-section spatial association
 ```
 
-## Run The Quantification Pipeline
+## Validation
 
-```bash
-python run_pipeline.py --config config.yaml
-```
+The statistics and certification machinery are validated separately from the biological
+datasets. Harnesses live in `validation/` (cross-K vs. brute force; DCLF calibration; the
+reweighted-null 500-run size/power calibration; cross-validation against R `spatstat`;
+registration certification on ANHIR/CIMA expert landmarks; real-data CODEX controls;
+restained segmentation against expert masks). The consolidated results table is in
+**`ihc.md` → Appendix A**.
 
-The pipeline scans `input_dir` for supported image files, runs QuPath
-headlessly, and writes results to `output_dir` and `dashboard_dir`.
+**Honest scope:** the *method* is validated; a finished CD8/TIM-3 biological result is not —
+no serial-section pair has yet passed registration certification on the target cohort, which
+is a data-acquisition limit, not a software one. See the documents below.
 
-## Run Co-Localization
+## Documentation
 
-Co-localization is launched from the desktop UI, or from the command line with a
-config that includes `coloc_pairs`:
+- **`moonshot_paper.md`** — the problem, the first-principles insight, the technical
+  foundations, the validation, and the future.
+- **`ihc.md`** — full technical reference + consolidated validation ledger (Appendix A) +
+  corrections log (Appendix B).
+- **`learn.md`** — plain-language companion explaining the whole project with no assumed
+  background in pathology, microscopy, or statistics.
 
-```bash
-python run_pipeline.py --config config.yaml --mode coloc
-```
+## Resources
 
-Pairs are processed stain-by-stain, registered into a shared coordinate space,
-and matched by mutual nearest neighbour within `max_distance_um`.
+- Vision deck (~50 slides): https://canva.link/agmetzji7s05ify
+- Supporting materials — outputs, overlays, segmentation validation (Google Drive):
+  https://drive.google.com/drive/folders/1N3wTEH9Won0i12BUm7qTa2qOzFoo7s2J?usp=share_link
 
-## Configuration
+## Credits
 
-`config.example.yaml` contains safe defaults and placeholders. Do not commit
-your local `config.yaml`; it may include private paths, sample names, or output
-locations.
+Built on QuPath, the InstanSeg `brightfield_nuclei` model, and the scientific Python stack
+(NumPy, SciPy, scikit-image, OpenCV, Shapely, SimpleITK, matplotlib, pywebview). Validated
+against, and crediting, the Schürch et al. 2020 colorectal CODEX dataset, the ANHIR/CIMA
+expert-landmark benchmark, the HNSCC mIF/mIHC comparison dataset, and the spatial-statistics
+literature (Ripley's K; Baddeley–Møller–Waagepetersen inhomogeneous K; the
+Diggle–Cressie–Loosmore–Ford envelope test). Cross-validated against R `spatstat`.
 
-Important fields:
+## License
 
-- `dab_threshold`: DAB mean OD threshold for positive classification.
-- `default_pixel_size`: microns per pixel used when no image metadata override
-  is available.
-- `device`: InstanSeg device, such as `mps`, `cuda`, or `cpu`.
-- `cleanup_intermediates`: remove CSV, GeoJSON, logs, and metadata after
-  summary outputs are created.
-
-## Repository Hygiene
-
-The `.gitignore` excludes local secrets, virtual environments, generated QuPath
-scripts, analysis outputs, and large microscopy image formats. Keep raw datasets
-and machine-specific files outside Git.
+MIT — see [LICENSE](LICENSE).
