@@ -1,8 +1,7 @@
 # IHC Analyzer — Technical Reference
 
-> **Submission note.** This is the full technical reference accompanying the Moonshot
-> submission *"Spatial biology for the price of a stain."* For the thesis and vision, read
-> **`moonshot_paper.md`**; for a no-background plain-language companion, read **`learn.md`**;
+> **About this document.** The full technical reference for this project. For the thesis and
+> vision, read **`paper.md`**; for a no-background plain-language companion, read **`learn.md`**;
 > for the consolidated validation numbers, see **Appendix A** below (or the spreadsheet
 > `outputs/ihc_validation_results_by_type.xlsx`). This document is the deep engineering record.
 >

@@ -73,3 +73,8 @@ submission_links.md
 ppt.md
 problems.md
 audit_*.md
+
+# Repository showcase assets
+!assets/
+!assets/*.png
+!assets/*.jpg

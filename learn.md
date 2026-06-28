@@ -1,8 +1,8 @@
 # Learn: IHC Analyzer explained in plain English
 
-> Plain-language companion to the Moonshot submission *"Spatial biology for the price of
-> a stain."* It assumes **no background** in pathology, microscopy, or statistics. For the
-> thesis and vision read `moonshot_paper.md`; for the deep engineering record read `ihc.md`.
+> Plain-language companion to this project. It assumes **no background** in pathology,
+> microscopy, or statistics. For the thesis and vision read `paper.md`; for the deep
+> engineering record read `ihc.md`.
 
 This document follows the same flow as the project:
 

@@ -2,7 +2,7 @@
 
 ### Recovering multiplex-grade immune maps from century-old brightfield pathology — and engineering the instrument that makes a cheap substitute trustworthy enough to trust with a clinical question
 
-**A Moonshot Paper**
+**Project Paper**
 
 *Author: Mukilan Senthilkumar* · June 2026
 
@@ -357,7 +357,7 @@ T cells and exhausted T cells occupy the same tumour neighbourhoods, and returns
 defensible spatial answer or an honest "the data cannot support this." No six-figure machine.
 No samples shipped to a distant core facility. And no confident lie.
 
-That is the moonshot: not a cheaper imitation of multiplex, but a new category — **spatial
+That is the goal: not a cheaper imitation of multiplex, but a new category — **spatial
 biology that is simultaneously universally affordable and constitutionally honest**. The first
 of these makes the frontier reachable for everyone; the second is the only reason reaching it
 that cheaply can be trusted with a human life.
